@@ -1,60 +1,86 @@
 from curseforge import CurseforgeUnauthorized, CurseforgeAuthorized, download_mod_link
 from concurrent.futures import ThreadPoolExecutor
 from tempfile import TemporaryDirectory
+from argparse import ArgumentParser
 from zipfile import ZipFile
-from logger import logger
+from logger import get_logger
 from shutil import copy2
 
 import asyncio
+import logging
 import time
 import json
 import sys
 import os
 
+DEBUG = False
+DOWNLOAD_THREADS=10
 
-async def download_mods(manifest, out_dir, api_key: str | None) -> list[tuple[str, None] | tuple[None, Exception, str, str]]:
+logger = get_logger()
+
+
+async def download_mods(
+    manifest,
+    out_dir,
+    api_key: str | None
+) -> list[tuple[str, None] | tuple[None, Exception, str, str]]:
     logger.info("Start downloading mods")
 
     cf = CurseforgeUnauthorized() if api_key is None else CurseforgeAuthorized(api_key)
-    
-    results = []
     files = manifest["files"]
-    
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        loop = asyncio.get_event_loop()
-        tasks = []
-        
+
+    retry_counters: dict[str, int] = {}
+    results: list[tuple[str, None] | tuple[None, Exception, str, str]] = []
+
+    progress = logger.createProgress(len(files))
+
+    def submit_one(executor: ThreadPoolExecutor, pid, fid):
+        loop = asyncio.get_running_loop()
+        return loop.run_in_executor(executor, cf.download_file, pid, fid, out_dir)
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS) as executor:
+        pending: set[asyncio.Future] = set()
+
         for file in files:
             pid = file["projectID"]
             fid = file["fileID"]
-            tasks.append(loop.run_in_executor(executor, cf.download_file, pid, fid, out_dir))
-        
-        retry_counters = dict()
-        while len(tasks) > 0:
-            retry = []
-            for result in await asyncio.gather(*tasks):
-                if result[1] == None: # if not err
+            pending.add(submit_one(executor, pid, fid))
+
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+            retry: list[asyncio.Future] = []
+
+            for fut in done:
+                result = fut.result()
+                # result: (ok_path, None) OR (None, exc, pid, fid)
+
+                if result[1] is None:
                     results.append(result)
+                    progress.progress = len(results)
+                    progress.render()
                     continue
 
-                # err = result[1]
-                pid = result[2]
-                fid = result[3]
+                _, err, pid, fid = result
+                retry_counters[pid] = retry_counters.get(pid, 0) + 1
 
-                retry_counters[pid] = 1 if retry_counters.get(pid) == None else retry_counters.get(pid) + 1
                 if retry_counters[pid] > 2:
                     results.append(result)
+                    progress.progress = len(results)
+                    progress.render()
                     continue
-                
-                logger.info("[projectID: %s] Retrying... %d" % (pid, retry_counters.get(pid)))
-                time.sleep(1)
-                retry.append(loop.run_in_executor(executor, cf.download_file, pid, fid, out_dir))
-            
-            tasks = []
-            
-            if len(retry) > 0:
-                tasks = retry
+
+                logger.info("[projectID: %s] Retrying... %d" % (pid, retry_counters[pid]))
+                await asyncio.sleep(1)
+
+                retry.append(submit_one(executor, pid, fid))
+
+            for f in retry:
+                pending.add(f)
+
     
+    progress.progress = progress.maxProgress
+    progress.render()
     return results
 
 
@@ -170,8 +196,20 @@ async def main(modpack_filepath):
 
     logger.info("Modpack loaded!")
 
+
+parser = ArgumentParser("Forge Modpack Downloader")
+parser.add_argument("modpack", help=".zip file of modpack")
+parser.add_argument("-t", "--threads", default=10, type=int, help="count of threads using for downloading a modpack")
+parser.add_argument("--debug", action='store_true', help="activate debug mode")
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or "-h" in sys.argv or "--help" in sys.argv:
-        print("usage: main.py <modpack_path.zip>")
-        exit()
-    asyncio.run(main(sys.argv[1]))
+    res = parser.parse_args(sys.argv[1:])
+
+    DEBUG = res.debug
+    DOWNLOAD_THREADS = res.threads
+
+    if DEBUG:
+        logger.LOGGER.setLevel(logging.DEBUG)
+        logger.warning("DEBUG is active")
+
+    asyncio.run(main(res.modpack))
